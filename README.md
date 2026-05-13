@@ -313,3 +313,65 @@ after the handler returns — the middleware will commit/rollback as soon as
 the handler returns, and the underlying `*sql.Tx` becomes invalid. Use
 `Outside(c)` for fire-and-forget work, or wait for the goroutine before
 returning from the handler.
+
+---
+
+## Propagating cancellation to outbound calls
+
+The middleware wraps `c.UserContext()` with the configured `Timeout`. **Any
+outbound call (HTTP, gRPC, Redis, message broker, etc.) that receives this
+context will be cancelled automatically when the request times out, errors,
+or the client disconnects** — Go's standard libraries already implement this:
+`net/http` aborts the in-flight TCP request, `database/sql` interrupts the
+query, gRPC closes the stream, and so on.
+
+For this to work you must **thread the context through every outbound call**.
+The package can't do this for you — it would require wrapping every client
+type in the ecosystem. The discipline is:
+
+```go
+func chargeExternal(c *fiber.Ctx, userID uint) error {
+    // ✅ Pass the request context — cancels on Fiber timeout/error/panic.
+    req, err := http.NewRequestWithContext(c.UserContext(),
+        http.MethodPost, "https://payments.example/charge", body)
+    if err != nil {
+        return err
+    }
+    resp, err := http.DefaultClient.Do(req)
+    // ...
+}
+
+func chargeExternalBAD(userID uint) error {
+    // ❌ No context: the call will keep running after the request times out,
+    //    burning a goroutine and a connection until the remote replies.
+    resp, err := http.Post("https://payments.example/charge", "...", body)
+    // ...
+}
+```
+
+The same applies to gRPC (`grpc.Invoke(ctx, ...)`), Redis
+(`rdb.Get(ctx, ...)`), AWS SDK v2 (`client.GetItem(ctx, ...)`), and any other
+client that accepts a `context.Context` as its first argument.
+
+**Service / repository layers:** use the `*Ctx` variants
+(`DBFromCtx`, `OutsideCtx`, `OnRollbackCtx`, `OnCommitCtx`) so the same
+`context.Context` flows through the whole call chain — DB, HTTP, gRPC, queue
+publishes, etc. — and a single cancellation point unwinds everything.
+
+**When you need to escape cancellation** (e.g. publishing a "request-failed"
+event to a queue from `OnRollback` callbacks), `Outside(c)` already gives you
+a context decoupled from the request cancellation while preserving values
+like request-id and trace headers — use the same pattern for outbound HTTP
+in that scenario:
+
+```go
+txctx.OnRollback(c, func(_ *gorm.DB) error {
+    // Need a fresh ctx because c.UserContext() is already cancelled here.
+    ctx, cancel := context.WithTimeout(
+        context.WithoutCancel(c.UserContext()), 3*time.Second)
+    defer cancel()
+    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, alertURL, body)
+    _, _ = http.DefaultClient.Do(req)
+    return nil
+})
+```
