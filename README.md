@@ -1,35 +1,41 @@
 # go-fiber-gorm
 
-A [Fiber](https://github.com/gofiber/fiber) + [GORM](https://gorm.io) middleware that manages database transactions transparently at the request level. Supports both Fiber **v2** and **v3**.
+A toolbox for production [Fiber](https://github.com/gofiber/fiber) + [GORM](https://gorm.io) services. It ships two complementary primitives that share the same design philosophy (framework-agnostic core + thin Fiber adapters for v2 and v3):
+
+1. **`txctx` / `txctxv3`** — request-scoped database transactions with lazy `BEGIN`, automatic rollback on error/timeout/panic, and commit/rollback callbacks.
+2. **`gsfiber` / `gsfiberv3`** — Kubernetes-aware graceful shutdown for Fiber + GORM + outbound calls, with ordered phases, hooks, readiness probe, and force-kill ceiling.
 
 **Module:** `github.com/adrielcodeco/go-fiber-gorm`
 
-| Fiber | Import path | Go min |
-|---|---|---|
-| v2 | `github.com/adrielcodeco/go-fiber-gorm/txctx` | 1.22 |
-| v3 | `github.com/adrielcodeco/go-fiber-gorm/txctxv3` | 1.25 |
+| Feature | Fiber v2 | Fiber v3 | Go min |
+|---|---|---|---|
+| Request-scoped transactions | `…/txctx` | `…/txctxv3` | 1.22 / 1.25 |
+| Graceful shutdown | `…/gsfiber` | `…/gsfiberv3` | 1.22 / 1.25 |
 
-The two adapters share a framework-agnostic engine (`txcore`) so both have identical semantics.
+Each pair shares a framework-agnostic engine (`txcore`, `gscore`) so both Fiber versions have identical semantics.
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
-- [Installation](#installation)
-- [Public API](#public-api)
-- [Usage](#usage)
-  - [1. Setup](#1-setup)
-  - [2. Read-only handler](#2-read-only-handler)
-  - [3. Simple write (lazy tx)](#3-simple-write-lazy-tx)
-  - [4. Multiple writes in the same transaction](#4-multiple-writes-in-the-same-transaction)
-  - [5. Outside — write that survives rollback](#5-outside--write-that-survives-rollback)
-  - [6. OnRollback — compensating transaction](#6-onrollback--compensating-transaction)
-  - [7. OnCommit — outbox / post-commit event](#7-oncommit--outbox--post-commit-event)
-  - [8. Handler returns error → rollback](#8-handler-returns-error--rollback)
-  - [9. Panic → rollback + re-panic](#9-panic--rollback--re-panic)
-  - [10. Layered architecture](#10-layered-architecture)
-- [Commit / Rollback Decision Table](#commit--rollback-decision-table)
+- [Transactions (`txctx` / `txctxv3`)](#transactions-txctx--txctxv3)
+  - [Features](#features)
+  - [Installation](#installation)
+  - [Public API](#public-api)
+  - [Usage](#usage)
+  - [Commit / Rollback Decision Table](#commit--rollback-decision-table)
+  - [Propagating cancellation to outbound calls](#propagating-cancellation-to-outbound-calls)
+- [Graceful Shutdown (`gsfiber` / `gsfiberv3`)](#graceful-shutdown-gsfiber--gsfiberv3)
+  - [Features](#features-1)
+  - [Installation](#installation-1)
+  - [Public API](#public-api-1)
+  - [Phases](#phases)
+  - [Usage](#usage-1)
+  - [Kubernetes integration](#kubernetes-integration)
+
+---
+
+## Transactions (`txctx` / `txctxv3`)
 
 ---
 
@@ -375,3 +381,273 @@ txctx.OnRollback(c, func(_ *gorm.DB) error {
     return nil
 })
 ```
+
+---
+
+## Graceful Shutdown (`gsfiber` / `gsfiberv3`)
+
+A coordinator for the full shutdown sequence of a Fiber + GORM service:
+**drain in-flight HTTP requests**, **cancel outbound calls**, **flush
+application state**, **close the database pool**, all bounded by per-phase
+and global timeouts. Designed around the Kubernetes pod lifecycle.
+
+### Features
+
+- **Phased sequence** — `PreStop → Drain → PostDrain → DB → PostDB`, so each
+  resource is cleaned up at the right moment (e.g. flush outbox *before*
+  closing the DB; close Redis *after*).
+- **Ordered hooks** — each phase runs registered hooks sorted by `Priority`;
+  a failing hook is logged but does not stop the sequence.
+- **`RootContext()`** — a `context.Context` that is cancelled the moment
+  shutdown begins. Derive outbound HTTP/gRPC/queue calls from it and they
+  abort cleanly on SIGTERM.
+- **Readiness flip** — `IsReady()` (and the provided `ReadinessHandler`)
+  returns `200` while serving and `503` once shutdown begins, so kube-proxy
+  can remove the pod from service endpoints before any request is dropped.
+- **Configurable timeouts** — independent `PreStopDelay`, `DrainTimeout`,
+  `HookTimeout`, `DBCloseTimeout`, plus a global `ForceKillAfter` that
+  `os.Exit(1)`s if the whole sequence overshoots
+  `terminationGracePeriodSeconds`.
+- **Configurable signals** — defaults to `SIGINT` + `SIGTERM`, override via
+  `Config.Signals`.
+- **Structured logging** — every phase logs begin/end with duration; plug
+  any logger that implements the 3-method `Logger` interface.
+- **GORM-aware** — closes the underlying `*sql.DB` of each registered
+  `*gorm.DB` with a deadline (avoids hanging on a stuck pool).
+- **Concurrent drain** — multiple `*fiber.App` instances (or anything
+  implementing `Shutdowner`) are drained in parallel under a shared
+  deadline.
+
+### Installation
+
+For Fiber v2:
+```bash
+go get github.com/adrielcodeco/go-fiber-gorm/gsfiber
+```
+
+For Fiber v3:
+```bash
+go get github.com/adrielcodeco/go-fiber-gorm/gsfiberv3
+```
+
+The two adapters share an engine (`gscore`); the public surface is
+identical apart from `*fiber.App` vs `fiber.App` and `*fiber.Ctx` vs
+`fiber.Ctx` in the readiness handler.
+
+### Public API
+
+```go
+// Manager
+gsfiber.New(cfg gsfiber.Config) *gsfiber.Manager
+
+// Registration
+gsfiber.RegisterApp(m *Manager, app *fiber.App)    // one or more
+mgr.RegisterDB(db *gorm.DB)                        // one or more
+mgr.AddHook(gsfiber.Hook{Name, Phase, Priority, Run})
+
+// Lifecycle
+mgr.RootContext() context.Context                  // cancelled on shutdown
+mgr.IsReady() bool                                 // false once shutdown began
+mgr.Trigger()                                      // start sequence programmatically
+mgr.ListenAndWait() error                          // block on signals + run
+mgr.Wait() error                                   // block until sequence done
+
+// Readiness probe
+gsfiber.ReadinessHandler(mgr) fiber.Handler
+
+// Phases (re-exported on the adapter package)
+gsfiber.PhasePreStop
+gsfiber.PhaseDrain
+gsfiber.PhasePostDrain
+gsfiber.PhaseDB
+gsfiber.PhasePostDB
+
+// Config
+type Config struct {
+    Signals        []os.Signal     // default: SIGINT, SIGTERM
+    PreStopDelay   time.Duration   // wait before any phase runs (default: 0)
+    DrainTimeout   time.Duration   // bound on HTTP drain (default: 25s)
+    HookTimeout    time.Duration   // bound per phase (default: 10s)
+    DBCloseTimeout time.Duration   // bound on each gorm.DB close (default: 5s)
+    ForceKillAfter time.Duration   // global ceiling, os.Exit(1) (default: 60s)
+    Logger         gscore.Logger   // structured logger; nil = silent
+    OnHookError    func(name string, phase gscore.Phase, err error)
+}
+```
+
+### Phases
+
+| Phase | Purpose |
+|---|---|
+| `PhasePreStop` | Runs first, while the server is still serving. Use for actions that need the HTTP layer alive (signal in-flight workers, flush in-memory queue). |
+| `PhaseDrain` | Drains all registered Fiber apps concurrently with `DrainTimeout`. |
+| `PhasePostDrain` | Runs after HTTP is fully drained, before DB close. Best place for outbound-call cleanups, worker pool waits, etc. |
+| `PhaseDB` | Closes each registered `*gorm.DB`'s underlying `*sql.DB` with `DBCloseTimeout`. |
+| `PhasePostDB` | Last phase. Use for resources that do not depend on the DB: Kafka producers, log flushers, metric exporters. |
+
+### Usage
+
+#### 1. Minimum setup
+
+```go
+func main() {
+    db := openGORM()
+    app := fiber.New()
+    app.Use(txctx.Middleware(db, txctx.Config{Timeout: 5 * time.Second}))
+    registerRoutes(app)
+
+    mgr := gsfiber.New(gsfiber.Config{
+        PreStopDelay:   5 * time.Second,  // give kube-proxy time to drop the endpoint
+        DrainTimeout:   25 * time.Second,
+        DBCloseTimeout: 5 * time.Second,
+        ForceKillAfter: 55 * time.Second, // < terminationGracePeriodSeconds
+    })
+    gsfiber.RegisterApp(mgr, app)
+    mgr.RegisterDB(db)
+
+    // Readiness probe flips to 503 the instant SIGTERM arrives.
+    app.Get("/healthz/ready", gsfiber.ReadinessHandler(mgr))
+
+    go func() {
+        if err := app.Listen(":8080"); err != nil {
+            mgr.Trigger() // server failed → start shutdown
+        }
+    }()
+
+    if err := mgr.ListenAndWait(); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+#### 2. Cancel outbound calls on shutdown
+
+Derive any long-running outbound call from `mgr.RootContext()`. It is
+cancelled the moment SIGTERM is observed, so the call aborts cleanly
+during the drain phase.
+
+```go
+go func() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-mgr.RootContext().Done():
+            return
+        case <-ticker.C:
+            req, _ := http.NewRequestWithContext(mgr.RootContext(),
+                http.MethodGet, "https://api.example/poll", nil)
+            _, _ = http.DefaultClient.Do(req)
+        }
+    }
+}()
+```
+
+For per-request outbound calls inside a handler, keep using
+`c.UserContext()` — `txctx` already wires its cancellation.
+
+#### 3. Ordered hooks across phases
+
+```go
+mgr.AddHook(gsfiber.Hook{
+    Name:     "outbox-flush",
+    Phase:    gsfiber.PhasePreStop, // before we stop accepting requests
+    Priority: 0,
+    Run: func(ctx context.Context) error {
+        return outbox.FlushAll(ctx)
+    },
+})
+
+mgr.AddHook(gsfiber.Hook{
+    Name:     "kafka-close",
+    Phase:    gsfiber.PhasePostDB,  // after DB is closed
+    Priority: 10,
+    Run: func(ctx context.Context) error {
+        return kafkaProducer.Close()
+    },
+})
+
+mgr.AddHook(gsfiber.Hook{
+    Name:     "redis-close",
+    Phase:    gsfiber.PhasePostDB,
+    Priority: 0, // runs before kafka-close (lower priority first)
+    Run: func(ctx context.Context) error {
+        return redisClient.Close()
+    },
+})
+```
+
+Lower `Priority` runs first within the same phase; equal priorities run in
+registration order.
+
+#### 4. Custom logger
+
+Any type that satisfies the three-method `gscore.Logger` interface works
+(slog, zap, zerolog, logrus, etc.).
+
+```go
+type slogAdapter struct{ l *slog.Logger }
+
+func (s slogAdapter) Info(msg string, kv ...any)  { s.l.Info(msg, kv...) }
+func (s slogAdapter) Warn(msg string, kv ...any)  { s.l.Warn(msg, kv...) }
+func (s slogAdapter) Error(msg string, kv ...any) { s.l.Error(msg, kv...) }
+
+mgr := gsfiber.New(gsfiber.Config{
+    Logger: slogAdapter{l: slog.Default()},
+})
+```
+
+#### 5. Triggering shutdown programmatically
+
+`mgr.Trigger()` starts the sequence from anywhere — useful for fatal
+errors caught outside the HTTP layer (e.g. a background worker losing a
+critical connection).
+
+```go
+if err := kafkaConsumer.Run(mgr.RootContext()); err != nil && !errors.Is(err, context.Canceled) {
+    log.Printf("consumer fatal: %v", err)
+    mgr.Trigger()
+}
+```
+
+`Trigger` is idempotent — the sequence runs exactly once regardless of
+how many times it is called or whether a signal also arrives.
+
+### Kubernetes integration
+
+A typical deployment lines up cleanly with the Manager's phases:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60   # > ForceKillAfter (55s in example above)
+  containers:
+  - name: api
+    readinessProbe:
+      httpGet:
+        path: /healthz/ready          # gsfiber.ReadinessHandler
+        port: 8080
+      periodSeconds: 2
+      failureThreshold: 1
+    lifecycle:
+      preStop:
+        exec:
+          # Optional: belt-and-suspenders if PreStopDelay isn't enough.
+          # The Manager already handles SIGTERM directly.
+          command: ["sleep", "5"]
+```
+
+The sequence on `kubectl delete pod`:
+
+1. Kubernetes sends `SIGTERM` and starts the `preStop` hook (in parallel).
+2. The Manager observes the signal → flips readiness to `503` → starts
+   `PreStopDelay`.
+3. kube-proxy sees the failing readiness probe and removes the pod from
+   service endpoints → no new requests arrive.
+4. `PreStopDelay` elapses → hooks run → HTTP drain → DB close → post-DB
+   hooks.
+5. Process exits cleanly, well before
+   `terminationGracePeriodSeconds`.
+
+Keep `ForceKillAfter` strictly **less than** `terminationGracePeriodSeconds`
+so the Manager's own ceiling fires first, with logs you can read, instead
+of an abrupt `SIGKILL` from the kubelet.
