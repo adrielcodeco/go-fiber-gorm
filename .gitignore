@@ -1,0 +1,37 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+*.cov
+/tmp/
+
+# Go workspace (kept locally for multi-module dev, do NOT publish)
+go.work
+go.work.sum
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Direnv / local env
+.envrc
+.env
+.env.local
+
+# Claude Code workspace
+.claude/
+
+# Build outputs
+/dist/
+/bin/
