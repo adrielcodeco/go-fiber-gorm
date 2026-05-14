@@ -1,13 +1,12 @@
-module example.com/examples
+module github.com/adrielcodeco/go-fiber-gorm/apmfiber
 
 go 1.23.0
 
 require (
-	github.com/adrielcodeco/go-fiber-gorm v0.0.0
 	github.com/adrielcodeco/go-fiber-gorm/apmcore v0.0.0
-	github.com/adrielcodeco/go-fiber-gorm/apmfiber v0.0.0
 	github.com/gofiber/fiber/v2 v2.52.13
-	gorm.io/gorm v1.30.0
+	go.elastic.co/apm/module/apmfiber/v2 v2.7.1
+	go.elastic.co/apm/v2 v2.7.1
 )
 
 require (
@@ -37,12 +36,10 @@ require (
 	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	go.elastic.co/apm/module/apmfasthttp/v2 v2.7.1 // indirect
-	go.elastic.co/apm/module/apmfiber/v2 v2.7.1 // indirect
 	go.elastic.co/apm/module/apmhttp/v2 v2.7.1 // indirect
 	go.elastic.co/apm/module/apmotel/v2 v2.7.1 // indirect
 	go.elastic.co/apm/module/apmsql/v2 v2.7.1 // indirect
 	go.elastic.co/apm/module/apmzap/v2 v2.7.1 // indirect
-	go.elastic.co/apm/v2 v2.7.1 // indirect
 	go.elastic.co/fastjson v1.5.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/otel v1.38.0 // indirect
@@ -54,11 +51,8 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
+	gorm.io/gorm v1.30.0 // indirect
 	howett.net/plist v1.0.0 // indirect
 )
 
-replace (
-	github.com/adrielcodeco/go-fiber-gorm => ../
-	github.com/adrielcodeco/go-fiber-gorm/apmcore => ../apmcore
-	github.com/adrielcodeco/go-fiber-gorm/apmfiber => ../apmfiber
-)
+replace github.com/adrielcodeco/go-fiber-gorm/apmcore => ../apmcore

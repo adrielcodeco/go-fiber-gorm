@@ -1,9 +1,10 @@
 # go-fiber-gorm
 
-A toolbox for production [Fiber](https://github.com/gofiber/fiber) + [GORM](https://gorm.io) services. It ships two complementary primitives that share the same design philosophy (framework-agnostic core + thin Fiber adapters for v2 and v3):
+A toolbox for production [Fiber](https://github.com/gofiber/fiber) + [GORM](https://gorm.io) services. It ships three complementary primitives that share the same design philosophy (framework-agnostic core + thin Fiber adapters for v2 and v3):
 
 1. **`txctx` / `txctxv3`** — request-scoped database transactions with lazy `BEGIN`, automatic rollback on error/timeout/panic, and commit/rollback callbacks.
 2. **`gsfiber` / `gsfiberv3`** — Kubernetes-aware graceful shutdown for Fiber + GORM + outbound calls, with ordered phases, hooks, readiness probe, and force-kill ceiling.
+3. **`apmfiber` / `apmfiberv3`** — Elastic APM tracing for Fiber + GORM + outgoing HTTP + Redis: foldable DB spans, log↔trace correlation, transaction labels, error capture, and DB-pool metrics.
 
 **Module:** `github.com/adrielcodeco/go-fiber-gorm`
 
@@ -11,8 +12,9 @@ A toolbox for production [Fiber](https://github.com/gofiber/fiber) + [GORM](http
 |---|---|---|---|
 | Request-scoped transactions | `…/txctx` | `…/txctxv3` | 1.22 / 1.25 |
 | Graceful shutdown | `…/gsfiber` | `…/gsfiberv3` | 1.22 / 1.25 |
+| Elastic APM instrumentation | `…/apmfiber` | `…/apmfiberv3` | 1.22 / 1.25 |
 
-Each pair shares a framework-agnostic engine (`txcore`, `gscore`) so both Fiber versions have identical semantics.
+Each trio shares a framework-agnostic engine (`txcore`, `gscore`, `apmcore`) so both Fiber versions have identical semantics.
 
 ---
 
@@ -32,6 +34,13 @@ Each pair shares a framework-agnostic engine (`txcore`, `gscore`) so both Fiber 
   - [Phases](#phases)
   - [Usage](#usage-1)
   - [Kubernetes integration](#kubernetes-integration)
+- [Elastic APM (`apmfiber` / `apmfiberv3`)](#elastic-apm-apmfiber--apmfiberv3)
+  - [Packages](#packages)
+  - [Features](#features-2)
+  - [Installation](#installation-2)
+  - [Quick start (Fiber v2)](#quick-start-fiber-v2)
+  - [Local stack](#local-stack)
+  - [Pitfall index](#pitfall-index)
 
 ---
 
@@ -651,3 +660,107 @@ The sequence on `kubectl delete pod`:
 Keep `ForceKillAfter` strictly **less than** `terminationGracePeriodSeconds`
 so the Manager's own ceiling fires first, with logs you can read, instead
 of an abrupt `SIGKILL` from the kubelet.
+
+---
+
+## Elastic APM (`apmfiber` / `apmfiberv3`)
+
+Wraps the [Elastic APM Go agent](https://www.elastic.co/guide/en/apm/agent/go/current/index.html)
+into the same core-plus-adapter shape used by the rest of this toolbox.
+
+### Packages
+
+| Submodule | Import | Purpose |
+|---|---|---|
+| `apmcore` | `github.com/adrielcodeco/go-fiber-gorm/apmcore` | Bootstrap + OTel bridge, DB driver wrapper, GORM plugin, pool metrics, zap helpers |
+| `apmfiber` | `github.com/adrielcodeco/go-fiber-gorm/apmfiber` | Fiber v2 middleware + labels + error capture |
+| `apmfiberv3` | `github.com/adrielcodeco/go-fiber-gorm/apmfiberv3` | Fiber v3 middleware + labels + error capture |
+
+Each submodule has its own `go.mod` so projects that don't need APM aren't
+forced to pull the Elastic + OTel dependency tree.
+
+### Features
+
+- **One-call bootstrap** — `apmcore.SetupOTelSDK(ctx)` wires the APM agent
+  into the OTel global providers and registers an `apm.MetricsGatherer`.
+  Returns a shutdown func to call after the server drains.
+- **Fiber middleware** — `apmfiber.Middleware()` / `apmfiberv3.Middleware()`
+  starts an APM transaction per request, names it `<METHOD> <route>`, and
+  attaches it to the underlying `*fasthttp.RequestCtx`. Fiber v3 has no
+  upstream adapter — this package ships one.
+- **Transaction labels** — `Labels(LabelsConfig{...})` decodes a typed
+  struct from the request body once and publishes business identifiers
+  (`wallet_id`, `external_id`, …) as `labels.<key>` filters in Kibana.
+- **Inline error capture** — `CaptureError(c, err)` records an error
+  against the active transaction so handler-mapped errors (that never
+  bubble to Fiber's `ErrorHandler`) still appear in Kibana → APM → Errors.
+- **Foldable DB spans** — `apmcore.NewGormPlugin()` + a driver wrap via
+  `apmcore.RegisterDriver(name, baseDriver)` produce a parent gorm span
+  per logical operation, with prepare/exec/query/close spans nested
+  inside. Works with any `database/sql` driver — pgx, mysql, sqlite —
+  because the base driver is passed in.
+- **DB-pool metrics** — `apmcore.RegisterDBPoolMetrics(sqlDB)` emits
+  `db.pool.*` on the agent's metrics tick (chartable in Metrics Explorer).
+- **HTTP / Redis / zap helpers** — `WrapHTTPTransport`, `InstrumentRedis`,
+  `WrapZapCore`, `LogCtxFields` cover the surrounding instrumentation
+  surface without forcing a particular client style.
+
+### Installation
+
+```bash
+go get github.com/adrielcodeco/go-fiber-gorm/apmcore
+go get github.com/adrielcodeco/go-fiber-gorm/apmfiber       # Fiber v2
+# or
+go get github.com/adrielcodeco/go-fiber-gorm/apmfiberv3     # Fiber v3
+```
+
+Configure the agent via the standard `ELASTIC_APM_*` environment
+variables (`ELASTIC_APM_SERVER_URL`, `ELASTIC_APM_SERVICE_NAME`, …). The
+agent ignores `OTEL_*` variables — set both if you need the same value
+in both subsystems.
+
+### Quick start (Fiber v2)
+
+```go
+func main() {
+    shutdown, err := apmcore.SetupOTelSDK(context.Background())
+    if err != nil { panic(err) }
+    http.DefaultTransport = apmcore.WrapHTTPTransport(http.DefaultTransport)
+
+    app := fiber.New()
+    app.Use(apmfiber.Middleware())          // must be first
+    app.Use(apmfiber.Labels(apmfiber.LabelsConfig{
+        Headers: map[string]string{"X-Origin": "origin"},
+    }))
+
+    go app.Listen(":8080")
+    // ... wait for shutdown signal, then drain ...
+    _ = shutdown(context.Background())
+}
+```
+
+### Local stack
+
+A reference `docker-compose.apm.yml` lives in `examples/`. It bootstraps
+Elasticsearch + Kibana + APM Server (8.13.4) with security enabled, the
+APM integration pre-installed, and recommended agent central
+configuration applied — no manual Kibana clicks required.
+
+```bash
+docker compose -f examples/docker-compose.apm.yml up -d
+open http://localhost:5601    # elastic / changeme
+```
+
+### Pitfall index
+
+- Read the active transaction via `c.Context()` (Fiber v2) or
+  `c.RequestCtx()` (Fiber v3), **not** `c.UserContext()` — the agent
+  stores the transaction on the underlying `*fasthttp.RequestCtx`.
+- Set `ELASTIC_APM_*` env vars; the agent ignores `OTEL_*`.
+- Call `apmcore.SetupOTelSDK` **before** opening DB/Redis clients so
+  they pick up the global TracerProvider.
+- `span, _ := apm.StartSpan(ctx, …)` discards the new ctx and breaks
+  span nesting — use `span, ctx := …`.
+- For foldable DB spans, the gorm plugin reassigns
+  `tx.Statement.Context`; preserve it through your repositories with
+  `db.WithContext(ctx)`.

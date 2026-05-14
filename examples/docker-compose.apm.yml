@@ -1,0 +1,116 @@
+# Reference Elastic Stack for the apmcore / apmfiber packages.
+#
+# Bootstraps Elasticsearch + Kibana + APM Server (8.13.4) with security
+# enabled and the APM integration auto-installed. Three one-shot services
+# (es-setup, apm-setup, apm-config) fix the chicken-and-egg setup steps
+# that otherwise need manual clicks in the Kibana UI.
+#
+# Usage:
+#   docker compose -f docker-compose.apm.yml up -d
+#   open http://localhost:5601  (login: elastic / changeme)
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    environment:
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.enabled=true
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports: ["9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:changeme http://localhost:9200/_cluster/health | grep -E '\"status\":\"(yellow|green)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Seeds the kibana_system password so Kibana can log in (8.x requires
+  # this; root `elastic` cannot be used by Kibana).
+  es-setup:
+    image: curlimages/curl:8.6.0
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    command: >
+      -s -u elastic:changeme -X POST
+      "http://elasticsearch:9200/_security/user/kibana_system/_password"
+      -H 'Content-Type: application/json'
+      -d '{"password":"changeme"}'
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=changeme
+      # 32+ char keys required for local dev — any deterministic value.
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=local-dev-encryption-key-32-chars!!
+      - XPACK_REPORTING_ENCRYPTIONKEY=local-dev-reporting-key-32-chars!!!!
+      - XPACK_SECURITY_ENCRYPTIONKEY=local-dev-security-key-32-chars!!!!!
+    ports: ["5601:5601"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Installs the APM integration via Fleet (auto-creates index templates
+  # and ingest pipelines). APM Server refuses to ingest until this is done.
+  # HTTP 200 and 409 (already installed) both mean success.
+  apm-setup:
+    image: curlimages/curl:8.6.0
+    depends_on:
+      kibana:
+        condition: service_healthy
+    command: >
+      -s -u elastic:changeme -X POST
+      "http://kibana:5601/api/fleet/epm/packages/apm"
+      -H "kbn-xsrf: true"
+
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:8.13.4
+    depends_on:
+      apm-setup:
+        condition: service_completed_successfully
+    command:
+      - --strict.perms=false
+      - -e
+      - -E output.elasticsearch.hosts=["http://elasticsearch:9200"]
+      - -E output.elasticsearch.username=elastic
+      - -E output.elasticsearch.password=changeme
+      - -E apm-server.host=0.0.0.0:8200
+    ports: ["8200:8200"]
+    healthcheck:
+      # apm-server image has bash but no curl/wget — use /dev/tcp probe.
+      test: ["CMD", "bash", "-c", "</dev/tcp/localhost/8200"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Pre-applies the recommended APM agent central configuration so the
+  # running app pulls these settings at runtime (no UI clicks needed).
+  apm-config:
+    image: curlimages/curl:8.6.0
+    depends_on:
+      apm-server:
+        condition: service_healthy
+    command: >
+      -s -u elastic:changeme -X PUT
+      "http://kibana:5601/api/apm/settings/agent-configuration"
+      -H "kbn-xsrf: true"
+      -H "Content-Type: application/json"
+      -d '{
+        "service":{},
+        "settings":{
+          "transaction_sample_rate":"1.0",
+          "capture_body":"all",
+          "transaction_max_spans":"1000",
+          "span_compression_enabled":"true",
+          "exit_span_min_duration":"1ms",
+          "recording":"true",
+          "log_level":"debug"
+        }
+      }'
